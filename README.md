@@ -26,6 +26,7 @@ A tiny Telegram bot that forwards YouTube (or any yt-dlp-supported) links to you
 ## 기능 / Features
 
 - 🎬 영상 최고화질(MP4) / 🎵 최고음질 MP3 / 🎬+🎵 둘 다 — 링크마다 버튼으로 선택
+- `둘 다` 선택 시 MeTube의 URL 중복 제한을 우회해 **영상과 음원을 모두** 등록
 - 한 메시지에 링크 여러 개를 넣으면 각각에 대해 버튼이 따로 표시됨
 - 재생목록 링크 지원 (MeTube가 전체를 대기열에 등록)
 - 폴링(long polling) 방식이라 포트 포워딩·외부 노출 불필요
@@ -74,18 +75,61 @@ sequenceDiagram
         alt 토큰 없음 (봇 재시작 등)
             B-->>TG: "요청이 만료되었어요"
         else 토큰 유효
-            loop 선택한 형식마다 (both면 mp4, mp3 2회)
-                B->>M: POST /add<br/>{url, quality:"best", format, auto_start:true}
-                M-->>B: {"status": "ok"}
-                M->>Y: 다운로드 시작
-                Y-->>M: 미디어 파일
-                M->>M: 저장 폴더에 기록
-            end
+            B->>M: POST /add<br/>{url, quality:"best", format, auto_start:true}
+            M-->>B: {"status": "ok"}
+            M->>Y: 다운로드 시작
+            Y-->>M: 미디어 파일
+            M->>M: 저장 폴더에 기록
             B-->>TG: editMessageText "✅ MeTube에 요청했어요!"
             TG-->>U: 결과 표시
         end
     end
 ```
+
+### 왜 "둘 다"는 한 번에 보내지 않나요?
+
+MeTube는 **대기열 중복을 URL만으로 판정**합니다. `format`은 판정 키에 포함되지 않기 때문에,
+같은 링크를 mp4·mp3로 연달아 보내면 **두 번째 요청은 조용히 버려집니다.**
+
+```python
+# MeTube app/ytdl.py — __add_entry()
+key = entry.get('webpage_url') or entry['url']      # ← URL 단독이 키
+if self.queue.exists(key) or self.pending.exists(key):
+    return {'status': 'ok', 'msg': f'Already in queue: {title}'}   # HTTP 200
+```
+
+다행히 **완료된 항목(`done`)은 중복 검사 대상이 아니므로**, 앞선 다운로드가 대기열을 떠나면
+같은 URL을 다른 형식으로 다시 등록할 수 있습니다. 봇은 이 성질을 이용합니다.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as bot.py
+    participant M as MeTube
+
+    Note over B: "🎬+🎵 둘 다" 선택
+
+    B->>M: POST /add (format=mp3)
+    Note right of B: 음원이 영상보다 빨리 끝나므로<br/>MP3를 먼저 등록
+    M-->>B: {"status":"ok"}
+    B-->>B: "✅ MP3 요청 완료 / ⏳ 영상은 이어서" 표시
+    B-->>B: 백그라운드 작업 시작
+
+    loop 중복이 아닐 때까지 (15초 → 최대 5분 간격, 최대 2시간)
+        B->>M: POST /add (format=mp4)
+        M-->>B: {"status":"ok",<br/>"msg":"Already in queue"}
+        Note right of B: 아직 MP3 처리 중 → 대기 후 재시도
+    end
+
+    Note over M: MP3 완료 → queue에서 done으로 이동
+
+    B->>M: POST /add (format=mp4)
+    M-->>B: {"status":"ok"}  (중복 아님)
+    B-->>B: "✅ 둘 다 요청 완료!" 로 메시지 수정
+```
+
+재시도 간격을 점점 늘리는 이유는, MeTube가 `/add` 요청마다 yt-dlp로 메타데이터를 다시 조회하기
+때문입니다. 짧은 간격으로 반복하면 대상 사이트에서 요청 제한에 걸릴 수 있습니다.
 
 ### 왜 토큰을 쓰나요? (핵심 설계 포인트)
 
@@ -180,8 +224,23 @@ classDiagram
         +on_button(update, ctx) async
     }
 
+    class Actions {
+        +handle_single(ctx, chat, msg, url, fmt) async
+        +handle_both(ctx, chat, msg, url) async
+        +queue_followup(...) async
+        +edit_text(ctx, chat, msg, text) async
+    }
+
     class MetubeClient {
-        +metube_add(url, fmt) tuple[bool, str]
+        +metube_add(url, fmt) AddResult
+        +metube_add_async(url, fmt) async
+    }
+
+    class AddResult {
+        <<NamedTuple>>
+        +ok: bool
+        +duplicate: bool
+        +msg: str
     }
 
     class Auth {
@@ -191,12 +250,16 @@ classDiagram
     class Application {
         <<python-telegram-bot>>
         +run_polling()
+        +create_task()
     }
 
     Application --> Handlers : 이벤트 디스패치
     Handlers --> Auth : 챗 ID 검사
     Handlers --> Config : pending 읽기/쓰기
-    Handlers --> MetubeClient : 다운로드 요청
+    Handlers --> Actions : 형식별 처리 위임
+    Actions --> MetubeClient : 다운로드 요청
+    Actions --> Application : 후속 등록 태스크 예약
+    MetubeClient --> AddResult : 결과 반환
     MetubeClient --> Config : METUBE_URL
 ```
 
@@ -205,7 +268,7 @@ classDiagram
 | `cmd_start` | `/start` | 사용 안내 출력 |
 | `cmd_id` | `/id` | 현재 대화의 챗 ID 표시 (`ALLOWED_CHAT_IDS` 설정용) |
 | `on_message` | 명령이 아닌 텍스트 | URL 추출 → 토큰 발급 → 형식 선택 버튼 표시 |
-| `on_button` | 인라인 버튼 콜백 | 토큰으로 URL 복원 → `metube_add()` 호출 → 결과로 메시지 수정 |
+| `on_button` | 인라인 버튼 콜백 | 토큰으로 URL 복원 → `handle_single()` / `handle_both()` 로 위임 |
 
 ### 파일
 
@@ -267,9 +330,10 @@ flowchart LR
 |---|---|
 | 🎬 영상 (최고화질) | MP4, `quality: best` |
 | 🎵 MP3 (최고음질) | MP3 오디오만 |
-| 🎬+🎵 둘 다 | `/add`를 두 번 호출해 영상·음원 모두 등록 |
+| 🎬+🎵 둘 다 | MP3를 먼저 등록하고, 영상은 MP3 처리가 끝나는 대로 **자동으로 이어서** 등록 ([이유](#왜-둘-다는-한-번에-보내지-않나요)) |
 
 3. `✅ MeTube에 요청했어요!` 가 뜨면 대기열 등록 완료입니다.
+   `둘 다`를 골랐다면 영상이 추가되는 시점에 메시지가 `✅ 둘 다 요청 완료!` 로 바뀝니다.
 4. 진행 상황과 완료 파일은 MeTube 웹 UI(기본 `:8081`)에서 확인합니다.
 
 ### 명령어
@@ -303,7 +367,9 @@ flowchart LR
 
 - 🟡 **재시작하면 대기 중인 버튼은 무효**가 됩니다. `pending`이 메모리에만 있기 때문입니다 (위 [상태 다이어그램](#왜-토큰을-쓰나요-핵심-설계-포인트) 참고). 링크를 다시 보내면 됩니다.
 - 🟡 봇이 알려주는 것은 **"MeTube에 요청 성공"까지**입니다. 다운로드 자체의 성공/실패는 MeTube 웹 UI에서 확인해야 합니다.
-- 🟡 `both`는 `/add`를 두 번 호출하므로 **같은 영상이 MP4와 MP3 두 항목**으로 대기열에 올라갑니다.
+- 🟡 `둘 다`의 영상 등록은 **MP3 처리가 끝난 뒤**에 이루어집니다. 앞선 다운로드가 2시간 안에 끝나지 않으면 포기하고 ⚠️ 안내를 표시하니, 그때는 링크를 다시 보내 🎬 영상을 선택하세요.
+- 🟡 `둘 다`의 대기 중 후속 등록도 **봇을 재시작하면 사라집니다**. 영상이 아직 추가되지 않았다면 링크를 다시 보내세요.
+- 🟡 이미 대기열에 있는 링크를 다시 요청하면 `ℹ️ 이미 대기열에 있어요` 가 표시됩니다. MeTube가 같은 URL을 형식과 무관하게 하나로 취급하기 때문이며, 오류가 아닙니다.
 - 🟡 URL 추출은 `https?://\S+` 정규식입니다. 링크 뒤에 괄호·구두점이 붙어 있으면 그대로 포함될 수 있습니다.
 - 🟡 재생목록 URL을 보내면 MeTube가 **전체를 등록**합니다. 한 편만 받고 싶다면 MeTube 컨테이너의 `YTDL_OPTIONS`에 `{"noplaylist": true}`를 설정하세요 (봇이 아니라 MeTube 쪽 설정입니다).
 - 🟡 봇 인스턴스는 하나만 띄우세요. 같은 토큰으로 두 개가 폴링하면 업데이트를 서로 뺏어갑니다.
@@ -322,6 +388,8 @@ flowchart LR
 | "허용되지 않은 사용자입니다" | `/id`로 확인한 값이 `ALLOWED_CHAT_IDS`에 있는지 (쉼표 구분, 공백 무관) |
 | "요청 실패: ... Connection refused" | `METUBE_URL`이 컨테이너에서 접근 가능한 주소인지. `localhost`는 봇 컨테이너 자신을 가리킵니다 — NAS 내부 IP나 도커 네트워크상의 서비스명을 쓰세요 |
 | "요청이 만료되었어요" | 봇이 재시작된 경우입니다. 링크를 다시 보내세요 |
+| `둘 다`를 눌렀는데 영상이 안 보임 | 정상입니다. MP3 처리가 끝난 뒤 자동으로 추가되며, 완료되면 메시지가 `✅ 둘 다 요청 완료!` 로 바뀝니다 |
+| "이미 MeTube 대기열에 있어요" | 같은 링크가 이미 처리 중입니다. MeTube는 형식과 무관하게 URL 하나당 한 항목만 받습니다 |
 | 요청은 성공인데 파일이 없음 | MeTube 웹 UI에서 해당 항목의 오류 메시지 확인 (지역 제한, 로그인 필요 영상 등) |
 
 ### 로컬에서 점검

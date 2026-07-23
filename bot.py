@@ -11,10 +11,12 @@ MeTube 텔레그램 봇
   ALLOWED_CHAT_IDS  : 허용할 텔레그램 챗 ID (쉼표로 여러 개, 비우면 아무나 사용 가능 - 비추천)
 """
 
+import asyncio
 import logging
 import os
 import re
 import uuid
+from typing import NamedTuple
 
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -46,12 +48,44 @@ URL_RE = re.compile(r"(https?://\S+)")
 # 짧은 ID를 발급해 메모리에 URL을 보관한다. (봇 재시작 시 대기 중이던 버튼은 무효화됨)
 pending: dict[str, str] = {}
 
+LABELS = {
+    "mp4": "🎬 영상 (최고화질)",
+    "mp3": "🎵 MP3 (최고음질)",
+    "both": "🎬 영상 + 🎵 MP3",
+}
+
+# MeTube는 대기열 중복을 URL만으로 판정한다(format은 키에 포함되지 않는다).
+# 그래서 같은 링크를 mp4/mp3로 연달아 요청하면 두 번째는 조용히 버려지고
+# {"status": "ok", "msg": "Already in queue: ..."} 가 HTTP 200으로 돌아온다.
+DUPLICATE_HINT = "already in queue"
+
+# 완료된 항목(done)은 중복 검사 대상이 아니므로, 앞선 다운로드가 대기열을 떠나면
+# 같은 URL을 다른 형식으로 다시 등록할 수 있다. "둘 다"는 이 성질을 이용해
+# 남은 형식을 백그라운드에서 재시도한다. (재시도마다 MeTube가 메타데이터를
+# 다시 긁으므로 간격을 점점 늘려 과도한 요청을 피한다)
+FOLLOWUP_FIRST_DELAY = 15  # 첫 재시도까지 대기(초)
+FOLLOWUP_MAX_DELAY = 300  # 재시도 간격 상한(초)
+FOLLOWUP_BACKOFF = 1.5  # 간격 증가 배수
+FOLLOWUP_DEADLINE = 2 * 60 * 60  # 총 재시도 시한(초)
+
+
+class AddResult(NamedTuple):
+    """MeTube /add 요청 결과.
+
+    ok=True, duplicate=True는 "요청은 받아들여졌지만 이미 대기열에 있어
+    새로 등록된 것은 없다"는 뜻이다. 성공으로 표시하면 안 된다.
+    """
+
+    ok: bool
+    duplicate: bool
+    msg: str
+
 
 def allowed(chat_id: int) -> bool:
     return not ALLOWED_CHAT_IDS or chat_id in ALLOWED_CHAT_IDS
 
 
-def metube_add(url: str, fmt: str) -> tuple[bool, str]:
+def metube_add(url: str, fmt: str) -> AddResult:
     """MeTube에 다운로드 요청. fmt: 'mp4'(영상) 또는 'mp3'(음원)."""
     try:
         r = requests.post(
@@ -63,13 +97,20 @@ def metube_add(url: str, fmt: str) -> tuple[bool, str]:
             data = r.json()
         except ValueError:
             data = {}
+        msg = str(data.get("msg") or "")
         log.info("metube response %s: %s", r.status_code, r.text[:200])
-        # HTTP 200이고 명시적 error가 아니면 성공으로 간주
+        # HTTP 200이고 명시적 error가 아니면 요청은 받아들여진 것.
+        # 다만 중복이면 실제로 등록된 항목이 없으므로 따로 구분한다.
         if r.ok and data.get("status") != "error":
-            return True, ""
-        return False, data.get("msg") or f"HTTP {r.status_code}"
+            return AddResult(True, DUPLICATE_HINT in msg.lower(), msg)
+        return AddResult(False, False, msg or f"HTTP {r.status_code}")
     except Exception as e:  # noqa: BLE001
-        return False, str(e)
+        return AddResult(False, False, str(e))
+
+
+async def metube_add_async(url: str, fmt: str) -> AddResult:
+    """metube_add를 별도 스레드에서 실행 (이벤트 루프를 막지 않도록)."""
+    return await asyncio.to_thread(metube_add, url, fmt)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -104,8 +145,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         keyboard = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("🎬 영상 (최고화질)", callback_data=f"mp4:{token}"),
-                    InlineKeyboardButton("🎵 MP3 (최고음질)", callback_data=f"mp3:{token}"),
+                    InlineKeyboardButton(LABELS["mp4"], callback_data=f"mp4:{token}"),
+                    InlineKeyboardButton(LABELS["mp3"], callback_data=f"mp3:{token}"),
                 ],
                 [
                     InlineKeyboardButton("🎬+🎵 둘 다", callback_data=f"both:{token}"),
@@ -115,6 +156,144 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(
             f"어떤 형식으로 받을까요?\n{url}", reply_markup=keyboard
         )
+
+
+async def edit_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, text: str) -> None:
+    """메시지 수정. 원본이 지워졌거나 내용이 같으면 조용히 넘어간다."""
+    try:
+        await context.bot.edit_message_text(text, chat_id=chat_id, message_id=message_id)
+    except Exception as e:  # noqa: BLE001
+        log.warning("failed to edit message %s: %s", message_id, e)
+
+
+async def queue_followup(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+    url: str,
+    fmt: str,
+    done_label: str,
+) -> None:
+    """앞선 다운로드가 대기열을 떠나면 남은 형식을 등록한다.
+
+    MeTube가 같은 URL을 동시에 두 번 받지 못하므로, 중복이 아니게 될 때까지
+    간격을 늘려가며 재시도한다.
+    """
+    delay = FOLLOWUP_FIRST_DELAY
+    waited = 0.0
+    last_msg = ""
+
+    while waited < FOLLOWUP_DEADLINE:
+        await asyncio.sleep(delay)
+        waited += delay
+        delay = min(delay * FOLLOWUP_BACKOFF, FOLLOWUP_MAX_DELAY)
+
+        result = await metube_add_async(url, fmt)
+        if result.ok and not result.duplicate:
+            log.info("followup queued %s as %s (after %.0fs)", url, fmt, waited)
+            await edit_text(
+                context,
+                chat_id,
+                message_id,
+                f"✅ 둘 다 요청 완료! [{done_label}]\n{url}\n\n"
+                "MeTube 웹 UI에서 진행 상황을 확인할 수 있어요.",
+            )
+            return
+
+        last_msg = result.msg
+        if not result.ok:
+            log.warning("followup attempt failed for %s (%s): %s", url, fmt, result.msg)
+
+    log.warning("followup gave up for %s as %s: %s", url, fmt, last_msg)
+    await edit_text(
+        context,
+        chat_id,
+        message_id,
+        f"⚠️ {LABELS['mp3']}는 등록했지만 {LABELS['mp4']}은 추가하지 못했어요.\n{url}\n\n"
+        f"({last_msg or '앞선 다운로드가 시간 내에 끝나지 않았어요'})\n"
+        "링크를 다시 보내 🎬 영상을 선택해 주세요.",
+    )
+
+
+async def handle_single(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, url: str, fmt: str
+) -> None:
+    result = await metube_add_async(url, fmt)
+    label = LABELS[fmt]
+
+    if not result.ok:
+        log.warning("failed to queue %s as %s: %s", url, fmt, result.msg)
+        await edit_text(
+            context,
+            chat_id,
+            message_id,
+            f"❌ 요청 실패: {result.msg}\n{url}\n\n"
+            "MeTube가 실행 중인지, METUBE_URL 설정이 맞는지 확인해 주세요.",
+        )
+        return
+
+    if result.duplicate:
+        log.info("already queued %s as %s", url, fmt)
+        await edit_text(
+            context,
+            chat_id,
+            message_id,
+            f"ℹ️ 이 링크는 이미 MeTube 대기열에 있어요. [{label}]\n{url}\n\n"
+            "MeTube는 같은 링크를 형식과 상관없이 하나로 취급합니다.\n"
+            "앞선 다운로드가 끝난 뒤 다시 요청해 주세요.",
+        )
+        return
+
+    log.info("queued %s as %s", url, fmt)
+    await edit_text(
+        context,
+        chat_id,
+        message_id,
+        f"✅ MeTube에 요청했어요! [{label}]\n{url}\n\n"
+        "다운로드가 끝나면 NAS 저장 폴더에서 확인할 수 있어요.",
+    )
+
+
+async def handle_both(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, url: str
+) -> None:
+    """영상과 MP3를 모두 등록한다.
+
+    MeTube가 같은 URL을 동시에 두 번 받지 못하므로 한 번에 둘 다 넣을 수 없다.
+    음원이 영상보다 먼저 끝나므로 MP3를 먼저 넣고, 영상은 백그라운드에서 이어 넣는다.
+    """
+    first, second = "mp3", "mp4"
+    result = await metube_add_async(url, first)
+
+    if not result.ok:
+        log.warning("failed to queue %s as %s: %s", url, first, result.msg)
+        await edit_text(
+            context,
+            chat_id,
+            message_id,
+            f"❌ 요청 실패: {result.msg}\n{url}\n\n"
+            "MeTube가 실행 중인지, METUBE_URL 설정이 맞는지 확인해 주세요.",
+        )
+        return
+
+    if result.duplicate:
+        head = f"ℹ️ {LABELS[first]}는 이미 대기열에 있어요."
+    else:
+        log.info("queued %s as %s", url, first)
+        head = f"✅ {LABELS[first]} 요청 완료!"
+
+    await edit_text(
+        context,
+        chat_id,
+        message_id,
+        f"{head}\n{url}\n\n"
+        f"⏳ {LABELS[second]}은 이 링크의 처리가 끝나는 대로 자동으로 이어서 요청할게요.\n"
+        "(MeTube는 같은 링크를 동시에 두 번 받지 못합니다)",
+    )
+
+    context.application.create_task(
+        queue_followup(context, chat_id, message_id, url, second, LABELS["both"])
+    )
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -135,32 +314,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.edit_message_text("요청이 만료되었어요. 링크를 다시 보내주세요.")
         return
 
-    labels = {
-        "mp4": "🎬 영상 (최고화질)",
-        "mp3": "🎵 MP3 (최고음질)",
-        "both": "🎬 영상 + 🎵 MP3",
-    }
-    label = labels.get(fmt, fmt)
-    formats = ["mp4", "mp3"] if fmt == "both" else [fmt]
+    chat_id = query.message.chat_id
+    message_id = query.message.message_id
 
-    errors = []
-    for f in formats:
-        ok, err = metube_add(url, f)
-        if not ok:
-            errors.append(f"{f}: {err}")
-
-    if not errors:
-        await query.edit_message_text(
-            f"✅ MeTube에 요청했어요! [{label}]\n{url}\n\n"
-            "다운로드가 끝나면 NAS 저장 폴더에서 확인할 수 있어요."
-        )
-        log.info("queued %s as %s", url, fmt)
-    else:
-        await query.edit_message_text(
-            f"❌ 요청 실패: {'; '.join(errors)}\n{url}\n\n"
-            "MeTube가 실행 중인지, METUBE_URL 설정이 맞는지 확인해 주세요."
-        )
-        log.warning("failed to queue %s: %s", url, errors)
+    if fmt == "both":
+        await handle_both(context, chat_id, message_id, url)
+    elif fmt in ("mp4", "mp3"):
+        await handle_single(context, chat_id, message_id, url, fmt)
 
 
 def main() -> None:
