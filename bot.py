@@ -7,7 +7,7 @@ MeTube 텔레그램 봇
 
 환경 변수:
   BOT_TOKEN         : BotFather에서 발급받은 봇 토큰 (필수)
-  METUBE_URL        : MeTube 주소 (예: http://192.168.219.253:8081)
+  METUBE_URL        : MeTube 주소 (예: http://YOUR_NAS_IP:8081)
   ALLOWED_CHAT_IDS  : 허용할 텔레그램 챗 ID (쉼표로 여러 개, 비우면 아무나 사용 가능 - 비추천)
 """
 
