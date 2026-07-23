@@ -50,4 +50,10 @@
   보내면 두 번째는 버려지면서 `{"status": "ok", "msg": "Already in queue: ..."}` 를 HTTP 200으로
   반환한다 — 성공으로 오판하기 쉬우니 주의. 완료(`done`)된 항목은 중복 검사 대상이 아니라
   다시 등록할 수 있다 (이슈 #1의 `둘 다` 구현 근거)
+- 완료 목록(`done`)도 URL이 키다 (`PersistentQueue.put`: `key = value.info.url`). 그래서 같은 URL을
+  영상·음원으로 받으면 **완료 목록에는 나중 항목 한 줄만 남는다.** 파일은 둘 다 정상 저장되며
+  봇에서 고칠 수 없다 — 사용자 문의가 오면 MeTube 동작임을 안내할 것
+- `format: "mp3"` 만 보내도 모든 버전에서 오디오로 처리된다. 2026-03 API 개편(`download_type` 도입)
+  때 레거시 호환 코드가 함께 들어가, `download_type` 없으면 `format` 으로 유추한다 —
+  굳이 `download_type` 을 보낼 필요 없음
 - 재생목록 URL은 MeTube가 알아서 전체 등록. `noplaylist` 등 yt-dlp 옵션은 MeTube 쪽 `YTDL_OPTIONS` 환경 변수로 제어 (봇이 아니라 MeTube 컨테이너 설정)
