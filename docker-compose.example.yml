@@ -1,0 +1,17 @@
+# 이 파일을 docker-compose.yml 로 복사한 뒤 값을 채워 사용하세요.
+# Copy this file to docker-compose.yml and fill in your values.
+# docker-compose.yml 은 .gitignore 에 등록되어 있어 커밋되지 않습니다.
+
+services:
+  metube-bot:
+    build: .
+    container_name: metube-telegram-bot
+    environment:
+      # BotFather에서 발급받은 봇 토큰 / Telegram bot token from @BotFather
+      - BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
+      # MeTube 주소 / Your MeTube URL
+      - METUBE_URL=http://YOUR_NAS_IP:8081
+      # 허용할 텔레그램 챗 ID (쉼표 구분, 봇에게 /id 전송으로 확인)
+      # Allowed Telegram chat IDs (comma-separated; send /id to the bot to find yours)
+      - ALLOWED_CHAT_IDS=
+    restart: unless-stopped

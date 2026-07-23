@@ -1,0 +1,12 @@
+# 실제 토큰/설정이 들어가는 파일 — 절대 커밋 금지
+docker-compose.yml
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+
+# 편집기/OS
+.DS_Store
+Thumbs.db
