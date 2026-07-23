@@ -19,12 +19,18 @@ import uuid
 from typing import NamedTuple
 
 import requests
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LinkPreviewOptions,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    Defaults,
     MessageHandler,
     filters,
 )
@@ -195,8 +201,7 @@ async def queue_followup(
                 context,
                 chat_id,
                 message_id,
-                f"✅ 둘 다 요청 완료! [{done_label}]\n{url}\n\n"
-                "MeTube 웹 UI에서 진행 상황을 확인할 수 있어요.",
+                f"✅ 둘 다 요청 완료 · {done_label}\n{url}",
             )
             return
 
@@ -209,9 +214,7 @@ async def queue_followup(
         context,
         chat_id,
         message_id,
-        f"⚠️ {LABELS['mp3']}는 등록했지만 {LABELS['mp4']}은 추가하지 못했어요.\n{url}\n\n"
-        f"({last_msg or '앞선 다운로드가 시간 내에 끝나지 않았어요'})\n"
-        "링크를 다시 보내 🎬 영상을 선택해 주세요.",
+        f"⚠️ 영상을 추가하지 못했어요 · 링크를 다시 보내 주세요\n{url}",
     )
 
 
@@ -224,34 +227,19 @@ async def handle_single(
     if not result.ok:
         log.warning("failed to queue %s as %s: %s", url, fmt, result.msg)
         await edit_text(
-            context,
-            chat_id,
-            message_id,
-            f"❌ 요청 실패: {result.msg}\n{url}\n\n"
-            "MeTube가 실행 중인지, METUBE_URL 설정이 맞는지 확인해 주세요.",
+            context, chat_id, message_id, f"❌ 요청 실패 · {result.msg}\n{url}"
         )
         return
 
     if result.duplicate:
         log.info("already queued %s as %s", url, fmt)
         await edit_text(
-            context,
-            chat_id,
-            message_id,
-            f"ℹ️ 이 링크는 이미 MeTube 대기열에 있어요. [{label}]\n{url}\n\n"
-            "MeTube는 같은 링크를 형식과 상관없이 하나로 취급합니다.\n"
-            "앞선 다운로드가 끝난 뒤 다시 요청해 주세요.",
+            context, chat_id, message_id, f"ℹ️ 이미 대기열에 있어요 · {label}\n{url}"
         )
         return
 
     log.info("queued %s as %s", url, fmt)
-    await edit_text(
-        context,
-        chat_id,
-        message_id,
-        f"✅ MeTube에 요청했어요! [{label}]\n{url}\n\n"
-        "다운로드가 끝나면 NAS 저장 폴더에서 확인할 수 있어요.",
-    )
+    await edit_text(context, chat_id, message_id, f"✅ 요청 완료 · {label}\n{url}")
 
 
 async def handle_both(
@@ -268,27 +256,21 @@ async def handle_both(
     if not result.ok:
         log.warning("failed to queue %s as %s: %s", url, first, result.msg)
         await edit_text(
-            context,
-            chat_id,
-            message_id,
-            f"❌ 요청 실패: {result.msg}\n{url}\n\n"
-            "MeTube가 실행 중인지, METUBE_URL 설정이 맞는지 확인해 주세요.",
+            context, chat_id, message_id, f"❌ 요청 실패 · {result.msg}\n{url}"
         )
         return
 
     if result.duplicate:
-        head = f"ℹ️ {LABELS[first]}는 이미 대기열에 있어요."
+        head = f"ℹ️ 이미 대기열에 있어요 · {LABELS[first]}"
     else:
         log.info("queued %s as %s", url, first)
-        head = f"✅ {LABELS[first]} 요청 완료!"
+        head = f"✅ 요청 완료 · {LABELS[first]}"
 
     await edit_text(
         context,
         chat_id,
         message_id,
-        f"{head}\n{url}\n\n"
-        f"⏳ {LABELS[second]}은 이 링크의 처리가 끝나는 대로 자동으로 이어서 요청할게요.\n"
-        "(MeTube는 같은 링크를 동시에 두 번 받지 못합니다)",
+        f"{head}\n⏳ 영상은 이어서 자동으로 등록할게요\n{url}",
     )
 
     context.application.create_task(
@@ -323,12 +305,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await handle_single(context, chat_id, message_id, url, fmt)
 
 
-def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).build()
+def build_app() -> Application:
+    # 메시지에 URL이 있으면 텔레그램이 썸네일·설명 미리보기를 자동으로 붙인다.
+    # 링크마다 카드가 반복되면 대화창이 번잡해지므로 봇이 보내는 모든 메시지에서 끈다.
+    # (사용자가 직접 보낸 링크의 미리보기는 봇이 제어할 수 없다)
+    defaults = Defaults(link_preview_options=LinkPreviewOptions(is_disabled=True))
+    app = Application.builder().token(BOT_TOKEN).defaults(defaults).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_handler(CallbackQueryHandler(on_button))
+    return app
+
+
+def main() -> None:
+    app = build_app()
     log.info("bot started. MeTube: %s / allowed: %s", METUBE_URL, ALLOWED_CHAT_IDS or "everyone")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
