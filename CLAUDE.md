@@ -31,12 +31,23 @@
 
 ## 테스트
 
+- 자동 테스트: `python -m unittest -v` (`test_bot.py`)
+  - 표준 라이브러리 `unittest`만 사용 — pytest 등 테스트 의존성을 추가하지 않는다
+  - `FakeMeTube`가 실제 MeTube의 URL 기반 중복 판정을 흉내 내므로, 서버 없이 검증 가능
+  - GitHub Actions(`.github/workflows/test.yml`)에서 push/PR마다 실행됨
 - 문법: `python -m py_compile bot.py`
-- 스모크: `BOT_TOKEN=123:dummy python -c "import bot"`
 - 실제 동작 확인은 NAS에서: 봇에게 링크 전송 → 버튼 3개 표시 → MeTube 웹 UI(8081)에 대기열 등록 확인
+
+**기능을 추가하거나 버그를 고치면 `test_bot.py`에 테스트를 함께 추가한다.**
+버그 수정 테스트에는 어떤 이슈의 회귀인지 docstring으로 남긴다.
+테스트가 실제로 회귀를 잡는지 확인하려면 수정을 일시적으로 무력화해 실패하는지 본다.
 
 ## MeTube API 참고
 
 - `POST {METUBE_URL}/add` body: `{"url", "quality": "best", "format": "mp4"|"mp3", "auto_start": true}`
 - 정상 응답: `{"status": "ok"}`
+- **대기열 중복은 URL만으로 판정된다** (`format`은 키가 아님). 같은 URL을 mp4/mp3로 연달아
+  보내면 두 번째는 버려지면서 `{"status": "ok", "msg": "Already in queue: ..."}` 를 HTTP 200으로
+  반환한다 — 성공으로 오판하기 쉬우니 주의. 완료(`done`)된 항목은 중복 검사 대상이 아니라
+  다시 등록할 수 있다 (이슈 #1의 `둘 다` 구현 근거)
 - 재생목록 URL은 MeTube가 알아서 전체 등록. `noplaylist` 등 yt-dlp 옵션은 MeTube 쪽 `YTDL_OPTIONS` 환경 변수로 제어 (봇이 아니라 MeTube 컨테이너 설정)

@@ -1,5 +1,7 @@
 # MeTube Telegram Bot
 
+[![test](https://github.com/progh2/metube-telegram-bot/actions/workflows/test.yml/badge.svg)](https://github.com/progh2/metube-telegram-bot/actions/workflows/test.yml)
+
 텔레그램으로 유튜브 링크를 보내면 NAS의 [MeTube](https://github.com/alexta69/metube)가 대신 다운로드해 주는 작은 텔레그램 봇입니다.
 
 A tiny Telegram bot that forwards YouTube (or any yt-dlp-supported) links to your self-hosted [MeTube](https://github.com/alexta69/metube) instance, so your NAS downloads them for you.
@@ -20,6 +22,7 @@ A tiny Telegram bot that forwards YouTube (or any yt-dlp-supported) links to you
 - [환경 변수](#환경-변수--environment-variables)
 - [주의사항](#주의사항--caveats)
 - [문제 해결](#문제-해결--troubleshooting)
+- [테스트](#테스트--tests)
 
 ---
 
@@ -276,6 +279,7 @@ classDiagram
 | 파일 | 설명 |
 |---|---|
 | `bot.py` | 봇 전체 로직 (단일 파일) |
+| `test_bot.py` | 테스트 (표준 라이브러리 `unittest`만 사용) |
 | `Dockerfile` | `python:3.12-slim` 기반 이미지 |
 | `docker-compose.example.yml` | 공개용 템플릿 — 복사해서 `docker-compose.yml`로 사용 |
 | `.gitignore` | 실제 토큰이 들어가는 `docker-compose.yml`, `.env` 제외 |
@@ -397,11 +401,40 @@ flowchart LR
 ### 로컬에서 점검
 
 ```bash
-python -m py_compile bot.py                      # 문법 검사
-BOT_TOKEN=123:dummy python -c "import bot"       # import 스모크 테스트
+pip install "python-telegram-bot==21.*" requests
+python -m unittest -v          # 테스트 (35건)
+python -m py_compile bot.py    # 문법 검사
 ```
 
 ---
+
+## 테스트 / Tests
+
+`test_bot.py` 35건. **추가 의존성 없이** 표준 라이브러리 `unittest`만 사용하며,
+push/PR마다 GitHub Actions에서 실행됩니다.
+
+```bash
+python -m unittest -v
+python -m unittest -k 둘_다      # 특정 테스트만
+```
+
+MeTube와 텔레그램은 가짜 객체로 대체합니다. 특히 `FakeMeTube` 는 실제 MeTube의
+**URL 기반 대기열 중복 판정**을 그대로 흉내 내기 때문에, 서버 없이도 `둘 다` 동작을
+끝까지 검증할 수 있습니다.
+
+| 대상 | 검증 내용 |
+|---|---|
+| `metube_add` | 성공 / 중복 / HTTP 오류 / 연결 실패 / 비(非)JSON 응답, 요청 본문 |
+| `allowed` | 허용 목록 비었을 때·포함될 때·아닐 때 |
+| `on_message` | URL 여러 개 추출, 버튼 3종, `callback_data` 64바이트 제한, URL 없음, 권한 거부 |
+| `handle_single` | 성공 / 중복은 ✅ 아님 / 실패 / 응답이 2줄로 간결한지 |
+| `handle_both` | MP3 선행 등록, 대기 중엔 영상 미등록, 완료 후 자동 등록, 시한 초과, 첫 요청 실패 시 후속 미예약 |
+| `on_button` | 토큰 만료·1회성, 형식별 요청, 권한 거부, 잘못된 `callback_data`, 로딩 표시 해제 |
+| `build_app` | 링크 미리보기 비활성, 핸들러 등록 |
+
+> 새 기능이나 버그 수정에는 테스트를 함께 추가합니다. 버그 수정 테스트에는
+> 어떤 이슈의 회귀인지 docstring으로 남깁니다
+> (예: `"""이슈 #1 회귀: 둘 다를 골랐으면 결국 둘 다 등록되어야 한다."""`).
 
 ## 주의 / Disclaimer
 
